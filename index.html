@@ -3,6 +3,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <!-- [SEC-PATCH-18] رؤوس أمان إضافية -->
+    <meta http-equiv="X-Content-Type-Options" content="nosniff">
+    <meta name="referrer" content="no-referrer">
     <title>بوابة المتاجر | شاهين إكسبريس</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
@@ -163,17 +166,56 @@
         else { c.style.width = '100vw'; c.style.height = '100vh'; }
     }
 
+    // [SEC-PATCH-10] حماية من هجمات القوة الغاشمة — مع استمرارية عبر إعادة التحميل
+    let _storeLoginAttempts = parseInt(sessionStorage.getItem('_st_attempts') || '0');
+    let _storeLoginLockUntil = parseInt(sessionStorage.getItem('_st_lock_until') || '0');
+
     async function checkAuth() {
+        const _now = Date.now();
+        if (_now < _storeLoginLockUntil) {
+            showToast("⛔ محظور مؤقتاً. انتظر " + Math.ceil((_storeLoginLockUntil - _now) / 1000) + " ثانية");
+            return;
+        }
         const email = document.getElementById('login-email').value.trim();
         const code  = document.getElementById('login-code').value.trim();
+        if (!email || !code) { showToast("يرجى إدخال جميع البيانات"); return; }
         const { data } = await _sb.from('restaurants').select('*').eq('email', email).eq('access_code', code).single();
-        if (data) { currentRes = data; localStorage.setItem('sh_store_session', JSON.stringify(data)); startApp(); }
-        else alert('بيانات الدخول غير صحيحة');
+        if (data) {
+            _storeLoginAttempts = 0;
+            sessionStorage.removeItem('_st_attempts');
+            sessionStorage.removeItem('_st_lock_until');
+            currentRes = data;
+            // [SEC-PATCH-26] إضافة timestamp للجلسة للتحقق من الصلاحية (24 ساعة)
+            const _sessionData = Object.assign({}, data, { _ts: Date.now() });
+            localStorage.setItem('sh_store_session', JSON.stringify(_sessionData));
+            startApp();
+        } else {
+            _storeLoginAttempts++;
+            sessionStorage.setItem('_st_attempts', _storeLoginAttempts);
+            if (_storeLoginAttempts >= 5) {
+                _storeLoginLockUntil = Date.now() + 60000;
+                sessionStorage.setItem('_st_lock_until', _storeLoginLockUntil);
+                _storeLoginAttempts = 0;
+                sessionStorage.setItem('_st_attempts', '0');
+            }
+            showToast('بيانات الدخول غير صحيحة ❌');
+        }
     }
 
     function startApp() {
         const session = localStorage.getItem('sh_store_session');
-        if (session) currentRes = JSON.parse(session);
+        // [SEC-PATCH-26] التحقق من صحة الجلسة وانتهاء صلاحيتها (24 ساعة)
+        if (session) {
+            try {
+                const parsed = JSON.parse(session);
+                const _SESSION_TTL = 24 * 60 * 60 * 1000;
+                if (parsed._ts && (Date.now() - parsed._ts) > _SESSION_TTL) {
+                    localStorage.removeItem('sh_store_session');
+                    return;
+                }
+                currentRes = parsed;
+            } catch(e) { localStorage.removeItem('sh_store_session'); return; }
+        }
         document.getElementById('auth-screen').style.display = 'none';
         document.getElementById('main-content').style.display = 'flex';
         document.getElementById('display-res-name').innerText = currentRes.name;
@@ -181,7 +223,9 @@
         document.getElementById('store-type-label').innerText = cfg.icon + ' ' + cfg.label;
         loadOrders(true);
         loadHistory();
-        setInterval(() => {
+        // [FIX-INTERVAL-41] منع تكديس المؤقتات عند إعادة استدعاء startApp
+        if (window._mainRefreshInterval41) clearInterval(window._mainRefreshInterval41);
+        window._mainRefreshInterval41 = setInterval(() => {
             refreshTimer += 33.4;
             document.getElementById('sync-bar').style.width = refreshTimer + '%';
             if (refreshTimer >= 100) { refreshTimer = 0; loadOrders(); loadHistory(); }
@@ -193,7 +237,12 @@
         const today = new Date(); today.setHours(0, 0, 0, 0);
         // نجلب فقط الطلبات المكتملة فعلاً (completed_consultation) لحساب الأرباح والأرشيف
         // store_invoice_sent لا يُحسب هنا لأن الطلب لم يُكتمل بعد (العميل لم يُرسل للمندوب)
-        const { data: all } = await _sb.from('sh_public_orders').select('*').eq('restaurant_name', currentRes.name).eq('status', 'completed_consultation');
+        // [PERF-PATCH-3] تحديد الأعمدة المطلوبة فقط + فلترة بتاريخ اليوم لتقليل البيانات
+        const { data: all } = await _sb.from('sh_public_orders')
+            .select('id,created_at,order_price,status')
+            .eq('restaurant_name', currentRes.name)
+            .eq('status', 'completed_consultation')
+            .gte('created_at', today.toISOString());
         if (all) {
             historyOrders = all;
             const d = all.filter(o => new Date(o.created_at) >= today);
@@ -215,9 +264,7 @@
             .in('status', ['consulting', 'accepted', 'pending_store', 'searching'])
             .order('created_at', { ascending: false });
 
-        console.log('[index5] restaurant_name:', currentRes.name);
-        console.log('[index5] orders found:', orders ? orders.length : 0, orders);
-        if (ordErr) console.error('[index5] loadOrders error:', ordErr);
+        // [SEC-PATCH-22] إزالة console.log الذي كان يسرب اسم المتجر وبيانات الطلبات
 
         // تصفية: لا نعرض الطلبات المؤرشفة محلياً (أُرسلت للمندوب)
         // أيضاً نتجاهل الطلبات التي صارت searching مع is_consultation=false (ذهبت للمندوب)
@@ -242,12 +289,14 @@
         list.innerHTML = orders.map(o => {
             const cfg      = getCfg(o.specialty_type || currentRes.specialty_type);
             const isActive = (o.status === 'consulting' || o.status === 'accepted' || o.status === 'searching');
-            return '<div class="order-card ' + (isActive ? 'status-active' : 'status-new') + '" id="card-' + o.id + '" style="border-right: 4px solid ' + cfg.color + ';">' +
+            // [SEC-PATCH-28] escHtml على بيانات العميل قبل حقنها في innerHTML
+            const _safeCustName = escHtml(o.customer_name || 'عميل شاهين');
+            return '<div class="order-card ' + (isActive ? 'status-active' : 'status-new') + '" id="card-' + escHtml(String(o.id)) + '" style="border-right: 4px solid ' + cfg.color + ';">' +
                 '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">' +
                 '<span style="font-size:9px; opacity:0.6;">#' + String(o.id).slice(-6) + '</span>' +
                 '<span class="order-type-tag" style="background:' + cfg.color + '22; color:' + cfg.color + ';">' + cfg.icon + ' ' + cfg.label + '</span>' +
                 '</div>' +
-                '<div style="font-weight:bold; font-size:13px; margin:4px 0;">' + (o.customer_name || 'عميل شاهين') + '</div>' +
+                '<div style="font-weight:bold; font-size:13px; margin:4px 0;">' + _safeCustName + '</div>' +
                 '<div style="font-size:10px; opacity:0.5; margin-bottom:6px;">' + new Date(o.created_at).toLocaleTimeString('ar-SY', {hour:'2-digit', minute:'2-digit'}) + '</div>' +
                 '<button class="btn-act ' + (isActive ? 'btn-follow' : 'btn-accept') + '" onclick="openChat(\'' + o.id + '\')">' +
                 (isActive ? 'متابعة الطلب' : 'قبول التواصل') +
@@ -320,7 +369,8 @@
         // إصلاح المشكلة الأولى: إرسال order_id كرقم إذا كان رقمياً أو كـ UUID
         const _oidForInsert = isNaN(activeOrderId) ? activeOrderId : Number(activeOrderId);
         const { data: saved, error: msgErr } = await _sb.from('sh_messages').insert({ order_id: _oidForInsert, sender: 'store', message: text }).select().single();
-        if (msgErr) { showToast('فشل ارسال الرسالة ❌'); console.error('sendMsg error:', msgErr); }
+        // [SEC-PATCH-30] إزالة console.error الذي يكشف تفاصيل خطأ قاعدة البيانات
+        if (msgErr) { showToast('فشل ارسال الرسالة ❌'); }
         if (saved) msgIds.add(saved.id);
         inp.disabled = false; // إعادة تفعيل الإدخال بعد الإرسال
         inp.focus();
@@ -427,18 +477,24 @@
 
     function openReportModal() {
         const container = document.getElementById('report-items-container');
+        // [SEC-PATCH-29] escHtml على بيانات الطلب في modal التقرير
         container.innerHTML = historyOrders.map(o =>
             '<div style="background: rgba(255,255,255,0.05); border-radius: 10px; padding: 10px; margin-bottom: 10px; border-right: 3px solid var(--gold);">' +
-            '<b>' + (o.customer_name || '') + '</b><br>' +
-            '<small>#' + o.id + ' | ' + new Date(o.created_at).toLocaleString('ar-SY') + '</small>' +
-            '<div style="font-size:10px; color:var(--gold); white-space:pre-line; margin-top:5px;">' + (o.order_details || '') + '</div>' +
+            '<b>' + escHtml(o.customer_name || '') + '</b><br>' +
+            '<small>#' + escHtml(String(o.id)) + ' | ' + new Date(o.created_at).toLocaleString('ar-SY') + '</small>' +
+            '<div style="font-size:10px; color:var(--gold); white-space:pre-line; margin-top:5px;">' + escHtml(o.order_details || '') + '</div>' +
             '</div>'
         ).join('') || '<p style="text-align:center;">لا توجد بيانات</p>';
         document.getElementById('report-modal').style.display = 'flex';
     }
     function closeReportModal() { document.getElementById('report-modal').style.display = 'none'; }
     function showToast(m) { const t = document.getElementById('toast'); t.innerText = m; t.style.display = 'block'; setTimeout(() => t.style.display = 'none', 3000); }
-    function logout() { localStorage.removeItem('sh_store_session'); location.reload(); }
+    function logout() {
+        // [FIX-LOGOUT-41] إيقاف المؤقت عند تسجيل الخروج لمنع تسرب الموارد
+        if (window._mainRefreshInterval41) { clearInterval(window._mainRefreshInterval41); window._mainRefreshInterval41 = null; }
+        if (_msgPollInterval) { clearInterval(_msgPollInterval); _msgPollInterval = null; }
+        localStorage.removeItem('sh_store_session'); location.reload();
+    }
     window.onload = () => { if (localStorage.getItem('sh_store_session')) startApp(); };
 </script>
 </body>
